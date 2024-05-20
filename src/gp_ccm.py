@@ -121,7 +121,7 @@ def GP_ccm_sig(y_embeddings_train, y_embeddings_test, x_train, x_test, noise, rb
     """
     # Specify the static kernel (for linear kernel use sigkernel.LinearKernel())
     static_kernel = sigkernel.RBFKernel(sigma = rbf_sigma)
-    dyadic_order = 1
+    dyadic_order = 3
 
     max_batch_size = y_embeddings_train.shape[0] + y_embeddings_test.shape[0]
 

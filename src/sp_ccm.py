@@ -3,6 +3,7 @@ import torch
 # import embedding code from sibling file
 from .embedding import embed
 from .utils import generate_mask_tensor
+from .iaaft import surrogates
 
 device = 'cpu'
 
@@ -26,11 +27,6 @@ def run_SP_CCM(y, x, filter, max_offset, L, device):
     Returns:
         rho_L_l (torch.Size(1, N])): Pearson's r correlation cofficient between predicted and true. between 0 and 1 where 1 is best.
     """
-
-    # Check: We currently don't account for this case
-    if (max_offset >= filter.shape[0]):
-        print("We have a problem.")
-
     large_value = torch.tensor([9999.], device = device)
     minus_one = torch.tensor([-1], device = device)
 
@@ -126,3 +122,74 @@ def run_SP_CCM(y, x, filter, max_offset, L, device):
                                   dim = 0)
 
     return rho_l
+
+
+def SP_CCM_iaaft(y, x_gt_iaaft_selected, selected_train_mask, ccmfilter, max_offset, device):
+    # run only for one mas
+
+    y_embeddings, x_gt = embed(ccmfilter, y, x_gt_iaaft_selected, max_offset, device)
+
+    # Extract N (rows) and E (columns) as we use it often: effective dimensionality of data
+    N = y_embeddings.shape[0]
+    E = y_embeddings.shape[1]
+
+    # truncate mask
+    selected_train_mask = selected_train_mask[0: N]
+    
+    large_value = torch.tensor([9999.], device = device)
+    minus_one = torch.tensor([-1], device = device)
+
+    # Pairwise distances: y_embeddings are torch.Size([N, E])
+    # results in shape torch.Size([N, N]) and symmetric
+    dist_euc = torch.cdist(y_embeddings, y_embeddings, p = 2).to(device)
+
+    # Mask distance to self with high value
+    # Add large value to diagonal (distance to self) so it effectively never gets used
+    dist_euc = dist_euc + (torch.eye(N).to(device) * large_value)
+
+    selected_train_mask = selected_train_mask.int().float().to(device)
+    selected_train_mask[selected_train_mask == 0.] = large_value
+
+    masked_distances = torch.mul(dist_euc, selected_train_mask)
+
+    #######################
+    ### Simplex weights ###
+    #######################
+
+    # Minimum b (b = E + 1) distances for each dist_i, l combination
+    # top_Eplus1_indices are absolute indices as nan's would not be top
+    # sizes are each torch.Size([N, E])
+    top_Eplus1_values, top_Eplus1_indices = masked_distances.topk(k = (E + 1), dim = -1, largest = False)
+
+    # torch.Size([N, 1])
+    top1_values = top_Eplus1_values[:, 0]
+
+    # torch.Size([N, 1])
+    ratio_to_top1 = torch.div(top_Eplus1_values, top1_values.unsqueeze(-1))
+
+    # element-wise cac ui with exponential
+    # WATCH: possibly a fragile point in computation
+    negative_ratios_to_top1 = ratio_to_top1.mul(minus_one)
+    ui = torch.exp(negative_ratios_to_top1)
+    # This line is needed to ensure differentiability in torch.exp() https://discuss.pytorch.org/t/torch-exp-is-modified-by-an-inplace-operation/90216
+    ui = ui + 0
+
+
+    # Add line for stability: for large ratio_to_top1 ui will go towards 0
+    ui[ui < 0.000001] = 0.000001
+    # calculate normalising rowsum of ui values
+    ui_rowsum = torch.sum(ui, dim = -1)
+    # weights
+    wi = torch.div(ui, ui_rowsum.unsqueeze(-1))
+
+    ###################
+    ### Predictions ###
+    ###################
+
+    # indices are absolute (relating to size N)
+    # sum over E weighted corresponding x_gt values
+    x_preds = torch.sum(torch.mul(x_gt[top_Eplus1_indices], wi), dim = -1)
+
+    rho = torch.corrcoef(torch.vstack((x_gt, x_preds)))[0, 1]
+
+    return rho
