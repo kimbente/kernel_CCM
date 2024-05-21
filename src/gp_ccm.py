@@ -2,6 +2,9 @@ import torch
 import math # for pi
 import sigkernel
 
+from .embedding import embed
+from .utils import generate_mask_tensor
+
 device = 'cpu'
 
 #################################
@@ -183,3 +186,63 @@ def GP_ccm_sig(y_embeddings_train, y_embeddings_test, x_train, x_test, noise, rb
 
     return rho, nlml
 
+
+def run_sigGPCCM_experiment(causal_x, causal_y, sig_filter, sig_shift, rbf_scale, noise_scale, n_train, device):
+
+    y_embeddings, x_gt = embed(filter = sig_filter, 
+                               y = causal_y, 
+                               x = causal_x,
+                               max_pos_offset = sig_shift, 
+                               device = device)
+    
+    N = y_embeddings.shape[0]
+    E = y_embeddings.shape[1]
+
+    l_train_masks = generate_mask_tensor(N, n_train)
+
+    # Generate N surrogate (permuted ts) of x_gt
+    causal_x_N_iaaft = torch.tensor(surrogates(x = x_gt.cpu(), ns = N, tol_pc = 5., verbose = False), dtype = torch.float32)
+
+    # placeholders
+    rho_l = torch.empty(size = (1, 0)).to(device)
+    rho_l_ind = torch.empty(size = (1, 0)).to(device)
+
+    for l in range(N):
+
+        ##############
+        ### GP-CCM ###
+        ##############
+
+        rho, _ = GP_ccm_sig(
+                y_embeddings_train = y_embeddings[l_train_masks[l]].unsqueeze(-1).to(device),
+                y_embeddings_test = y_embeddings[ ~ l_train_masks[l]].unsqueeze(-1).to(device),
+                x_train = x_gt[l_train_masks[l]].to(device),
+                x_test = x_gt[ ~ l_train_masks[l]].to(device),
+                noise = noise_scale, # for stability
+                rbf_sigma = rbf_scale,
+                device = device)
+        
+        ##########################
+        ### GP-CCM INDEPENDENT ###
+        ##########################
+
+        rho_ind, _= GP_ccm_sig(
+                y_embeddings_train = y_embeddings[l_train_masks[l]].unsqueeze(-1).to(device),
+                y_embeddings_test = y_embeddings[ ~ l_train_masks[l]].unsqueeze(-1).to(device),
+                x_train = causal_x_N_iaaft[l, l_train_masks[l]].to(device),
+                x_test = causal_x_N_iaaft[l, ~ l_train_masks[l]].to(device),
+                noise = noise_scale, # for stability
+                rbf_sigma = rbf_scale,
+                device = device)
+        
+        rho_l = torch.concat((rho_l, rho.unsqueeze(0).unsqueeze(0)), dim = 1)
+        rho_l_ind = torch.concat((rho_l_ind, rho_ind.unsqueeze(0).unsqueeze(0)), dim = 1)
+
+    p95 = torch.tensor([0.95]).to(device)
+
+    # print
+    print("Rho mean", np.round(rho_l.mean().item(), 3))
+    print("Rho std", np.round(rho_l.std().item(), 3))
+    print("Rho indep. p95", np.round(torch.quantile(rho_l_ind, p95).item(), 3))
+
+    return(rho_l.mean(), rho_l.std(), torch.quantile(rho_l_ind, p95))

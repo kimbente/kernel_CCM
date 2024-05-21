@@ -1,4 +1,5 @@
 import torch
+import numpy as np
 
 # import embedding code from sibling file
 from .embedding import embed
@@ -193,3 +194,72 @@ def SP_CCM_iaaft(y, x_gt_iaaft_selected, selected_train_mask, ccmfilter, max_off
     rho = torch.corrcoef(torch.vstack((x_gt, x_preds)))[0, 1]
 
     return rho
+
+
+def run_ccm_experiment(causal_x, causal_y, ccm_filter, ccm_shift, n_train, device):
+    
+    result_status = True
+
+    noise_increment = torch.tensor([0.025], device = device)
+    noise_creeper = torch.tensor([0.], device = device) - noise_increment
+
+    # True: we have nan
+    while (result_status == True):
+
+        # increment noise (0 in first iteration)
+        noise_creeper = noise_creeper + noise_increment
+
+        # Add noise (0 in first iteration)
+        causal_y = causal_y + (torch.randn(causal_y.shape[0], device = device) * noise_creeper)
+        
+        ###########
+        ### CCM ###
+        ###########
+
+        rho_l = run_SP_CCM(
+                        y = causal_y,
+                        x = causal_x,
+                        filter = ccm_filter,
+                        max_offset = ccm_shift,
+                        L = n_train,
+                        device = device)
+        
+        #######################
+        ### CCM INDEPENDENT ###
+        #######################
+
+        # Generate N surrogate (permuted ts)
+        causal_y_N_iaaft = torch.tensor(surrogates(x = causal_y.cpu(), ns = causal_y.shape[0], tol_pc = 5., verbose = False), dtype = torch.float32)
+
+        l_train_masks = generate_mask_tensor(causal_y.shape[0], n_train)
+
+        # placeholder
+        rho_l_ind = torch.empty(size = (1, 0)).to(device)
+
+        # N passes with a different surrogate each time
+        for l in range(causal_y_N_iaaft.shape[0]):
+
+            rho_ind = SP_CCM_iaaft(y = causal_y, 
+                            x_gt_iaaft_selected = causal_y_N_iaaft[l], 
+                            selected_train_mask = l_train_masks[l], 
+                            max_offset = ccm_shift,
+                            ccmfilter = ccm_filter, 
+                            device = device)
+            
+            rho_l_ind = torch.cat((rho_l_ind, rho_ind.unsqueeze(0).unsqueeze(0)), dim = 1)
+
+        p95 = torch.tensor([0.95]).to(device)
+
+        result_status = (rho_l.isnan().any() & rho_l_ind.isnan().any())
+
+        if (result_status == True):
+            print("We get nan's and have to increase the noise level.")
+
+    # print once while loop is finished
+    print("Rho mean", np.round(rho_l.mean().item(), 3))
+    print("Rho std", np.round(rho_l.std().item(), 3))
+    print("Rho indep. p95", np.round(torch.quantile(rho_l_ind, p95).item(), 3))
+
+    print("Added noise", np.round(noise_creeper.item(), 3))
+
+    return(rho_l.mean(), rho_l.std(), torch.quantile(rho_l_ind, p95), noise_creeper)
